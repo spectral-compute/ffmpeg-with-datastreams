@@ -1882,6 +1882,14 @@ typedef struct AVFormatContext {
      * @see skip_estimate_duration_from_pts
      */
     int64_t duration_probesize;
+
+    /**
+     * The format context to sync timestamps to for formats that generate
+     * timestamps in real time.
+     *
+     * This is for live inputs that don't have their own timestamps.
+     */
+    const struct AVFormatContext *sync_ts_to;
 } AVFormatContext;
 
 /**

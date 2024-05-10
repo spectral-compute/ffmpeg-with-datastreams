@@ -1663,6 +1663,10 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
         av_dict_set(&o->g->format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
+
+    if (nb_input_files > 1)
+        ic->sync_ts_to = input_files[0]->ctx;
+
     /* open the input file with generic avformat function */
     err = avformat_open_input(&ic, filename, file_iformat, &o->g->format_opts);
     if (err < 0) {
