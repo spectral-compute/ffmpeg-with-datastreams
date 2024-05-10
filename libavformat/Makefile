@@ -172,6 +172,7 @@ OBJS-$(CONFIG_CODEC2RAW_MUXER)           += rawenc.o
 OBJS-$(CONFIG_CONCAT_DEMUXER)            += concatdec.o
 OBJS-$(CONFIG_CRC_MUXER)                 += crcenc.o
 OBJS-$(CONFIG_DATA_DEMUXER)              += rawdec.o
+OBJS-$(CONFIG_LIVEDATA_DEMUXER)          += liverawdec.o
 OBJS-$(CONFIG_DATA_MUXER)                += rawenc.o
 OBJS-$(CONFIG_DASH_MUXER)                += dash.o dashenc.o hlsplaylist.o
 OBJS-$(CONFIG_DASH_DEMUXER)              += dash.o dashdec.o
