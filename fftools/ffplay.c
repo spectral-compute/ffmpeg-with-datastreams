@@ -124,6 +124,7 @@ typedef struct PacketQueue {
 #define VIDEO_PICTURE_QUEUE_SIZE 3
 #define SUBPICTURE_QUEUE_SIZE 16
 #define SAMPLE_QUEUE_SIZE 9
+#define DUMP_QUEUE_SIZE 256
 #define FRAME_QUEUE_SIZE FFMAX(SAMPLE_QUEUE_SIZE, FFMAX(VIDEO_PICTURE_QUEUE_SIZE, SUBPICTURE_QUEUE_SIZE))
 
 typedef struct AudioParams {
@@ -275,6 +276,11 @@ typedef struct VideoState {
     AVStream *subtitle_st;
     PacketQueue subtitleq;
 
+    int dump_stream;
+    AVStream *dump_st;
+    PacketQueue dumpq;
+    SDL_Thread *dump_tid;
+
     double frame_timer;
     double frame_last_returned_time;
     double frame_last_filter_delay;
@@ -314,6 +320,7 @@ static int screen_top = SDL_WINDOWPOS_CENTERED;
 static int audio_disable;
 static int video_disable;
 static int subtitle_disable;
+static const char *dump_url = NULL;
 static const char* wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
 static int seek_by_bytes = -1;
 static float seek_interval = 10;
@@ -1206,6 +1213,17 @@ static void video_audio_display(VideoState *s)
     }
 }
 
+static void dump_close(VideoState *is, int stream_index)
+{
+    packet_queue_abort(&is->dumpq);
+    SDL_WaitThread(is->dump_tid, NULL);
+    packet_queue_flush(&is->dumpq);
+
+    is->dump_tid = NULL;
+    is->dump_st = NULL;
+    is->dump_stream = -1;
+}
+
 static void stream_component_close(VideoState *is, int stream_index)
 {
     AVFormatContext *ic = is->ic;
@@ -1277,12 +1295,15 @@ static void stream_close(VideoState *is)
         stream_component_close(is, is->video_stream);
     if (is->subtitle_stream >= 0)
         stream_component_close(is, is->subtitle_stream);
+    if (is->dump_stream >= 0)
+        dump_close(is, is->dump_stream);
 
     avformat_close_input(&is->ic);
 
     packet_queue_destroy(&is->videoq);
     packet_queue_destroy(&is->audioq);
     packet_queue_destroy(&is->subtitleq);
+    packet_queue_destroy(&is->dumpq);
 
     /* free all pictures */
     frame_queue_destroy(&is->pictq);
@@ -2289,6 +2310,73 @@ static int subtitle_thread(void *arg)
     return 0;
 }
 
+static int dump_thread(void *arg)
+{
+    int e = 0;
+    VideoState *is = arg;
+    double tb = av_q2d(is->dump_st->time_base);
+    AVPacket *pkt = av_packet_alloc();
+
+    AVIOContext *io = NULL;
+    if ((e = avio_open(&io, dump_url, AVIO_FLAG_WRITE)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Could not open URL: %s\n", dump_url);
+        av_packet_free(&pkt);
+        return -1;
+    }
+
+    for (;;) {
+        double pts = 0.0;
+
+        // Get the next packet.
+        if ((e = packet_queue_get(&is->dumpq, pkt, 1, NULL)) < 0 ||
+            pkt->size == 0)
+            break; // No more packets. We never add one of size 0 to the queue.
+
+        // Wait until it's time to dump the packet. The get_master_clock
+        // function returns a time in PTS seconds.
+        pts = ((pkt->pts == AV_NOPTS_VALUE) ? pkt->dts : pkt->pts) * tb;
+        for (;;) {
+            double wait = pts - get_master_clock(is);
+            if (wait <= 0)
+                break;
+            av_usleep((wait >= 1.0) ? 1000000 : (unsigned int)(wait * 1e6));
+        }
+
+        // Emit the packet.
+        avio_write(io, pkt->data, pkt->size);
+        avio_flush(io);
+
+        // We're done with the packet data (but not the packet itself, as we
+        // probably move more data into it in the next iteration).
+        av_packet_unref(pkt);
+    }
+
+    av_packet_free(&pkt);
+    avio_close(io);
+    return e; // The return code is ignored anyway.
+}
+
+static int dump_open(VideoState *is, int stream_index)
+{
+    // Make sure the selected stream is valid.
+    if (stream_index < 0 || stream_index >= is->ic->nb_streams)
+        return -1;
+
+    // Set the URL to dump to if not given.
+    if (!dump_url)
+        dump_url = "pipe:1";
+
+    // Set up the stream.
+    is->dump_stream = stream_index;
+    is->dump_st = is->ic->streams[stream_index];
+    is->dump_st->discard = AVDISCARD_DEFAULT;
+
+    // Create a queue and start a worker thread to read from it.
+    packet_queue_start(&is->dumpq);
+    is->dump_tid = SDL_CreateThread(dump_thread, "data_dumper", is);
+    return 0;
+}
+
 /* copy samples for viewing in editor window */
 static void update_sample_display(VideoState *is, short *samples, int samples_size)
 {
@@ -2990,6 +3078,9 @@ static int read_thread(void *arg)
         stream_component_open(is, st_index[AVMEDIA_TYPE_SUBTITLE]);
     }
 
+    if (st_index[AVMEDIA_TYPE_DATA] >= 0)
+        dump_open(is, st_index[AVMEDIA_TYPE_DATA]);
+
     if (is->video_stream < 0 && is->audio_stream < 0) {
         av_log(NULL, AV_LOG_FATAL, "Failed to open file '%s' or configure filtergraph\n",
                is->filename);
@@ -3038,6 +3129,8 @@ static int read_thread(void *arg)
                     packet_queue_flush(&is->subtitleq);
                 if (is->video_stream >= 0)
                     packet_queue_flush(&is->videoq);
+                if (is->dump_stream >= 0)
+                    packet_queue_flush(&is->dumpq);
                 if (is->seek_flags & AVSEEK_FLAG_BYTE) {
                    set_clock(&is->extclk, NAN, 0);
                 } else {
@@ -3062,10 +3155,11 @@ static int read_thread(void *arg)
 
         /* if the queue are full, no need to read more */
         if (infinite_buffer<1 &&
-              (is->audioq.size + is->videoq.size + is->subtitleq.size > MAX_QUEUE_SIZE
+              (is->audioq.size + is->videoq.size + is->subtitleq.size + is->dumpq.size > MAX_QUEUE_SIZE
             || (stream_has_enough_packets(is->audio_st, is->audio_stream, &is->audioq) &&
                 stream_has_enough_packets(is->video_st, is->video_stream, &is->videoq) &&
-                stream_has_enough_packets(is->subtitle_st, is->subtitle_stream, &is->subtitleq)))) {
+                stream_has_enough_packets(is->subtitle_st, is->subtitle_stream, &is->subtitleq) &&
+                stream_has_enough_packets(is->dump_st, is->dump_stream, &is->dumpq)))) {
             /* wait 10 ms */
             SDL_LockMutex(wait_mutex);
             SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
@@ -3091,6 +3185,8 @@ static int read_thread(void *arg)
                     packet_queue_put_nullpacket(&is->audioq, pkt, is->audio_stream);
                 if (is->subtitle_stream >= 0)
                     packet_queue_put_nullpacket(&is->subtitleq, pkt, is->subtitle_stream);
+                if (is->dump_stream >= 0)
+                    packet_queue_put_nullpacket(&is->dumpq, pkt, is->dump_stream);
                 is->eof = 1;
             }
             if (ic->pb && ic->pb->error) {
@@ -3106,6 +3202,7 @@ static int read_thread(void *arg)
         } else {
             is->eof = 0;
         }
+
         /* check if packet is in play range specified by user, then queue, otherwise discard */
         stream_start_time = ic->streams[pkt->stream_index]->start_time;
         pkt_ts = pkt->pts == AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
@@ -3114,6 +3211,7 @@ static int read_thread(void *arg)
                 av_q2d(ic->streams[pkt->stream_index]->time_base) -
                 (double)(start_time != AV_NOPTS_VALUE ? start_time : 0) / 1000000
                 <= ((double)duration / 1000000);
+
         if (pkt->stream_index == is->audio_stream && pkt_in_play_range) {
             packet_queue_put(&is->audioq, pkt);
         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
@@ -3121,6 +3219,8 @@ static int read_thread(void *arg)
             packet_queue_put(&is->videoq, pkt);
         } else if (pkt->stream_index == is->subtitle_stream && pkt_in_play_range) {
             packet_queue_put(&is->subtitleq, pkt);
+        } else if (pkt->stream_index == is->dump_stream && pkt_in_play_range && pkt->size > 0) {
+            packet_queue_put(&is->dumpq, pkt);
         } else {
             av_packet_unref(pkt);
         }
@@ -3171,7 +3271,8 @@ static VideoState *stream_open(const char *filename,
 
     if (packet_queue_init(&is->videoq) < 0 ||
         packet_queue_init(&is->audioq) < 0 ||
-        packet_queue_init(&is->subtitleq) < 0)
+        packet_queue_init(&is->subtitleq) < 0 ||
+        packet_queue_init(&is->dumpq) < 0)
         goto fail;
 
     if (!(is->continue_read_thread = SDL_CreateCond())) {
@@ -3661,6 +3762,8 @@ static const OptionDef options[] = {
     { "ast",                OPT_TYPE_STRING, OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_AUDIO] }, "select desired audio stream", "stream_specifier" },
     { "vst",                OPT_TYPE_STRING, OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_VIDEO] }, "select desired video stream", "stream_specifier" },
     { "sst",                OPT_TYPE_STRING, OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_SUBTITLE] }, "select desired subtitle stream", "stream_specifier" },
+    { "dst",                OPT_TYPE_STRING, OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_DATA] }, "select desired data stream to dump", "stream_specifier" },
+    { "dump_url",           OPT_TYPE_STRING, OPT_EXPERT, { &dump_url }, "dump the data stream (dst) here", "url" },
     { "ss",                 OPT_TYPE_TIME,            0, { &start_time }, "seek to a given position in seconds", "pos" },
     { "t",                  OPT_TYPE_TIME,            0, { &duration }, "play  \"duration\" seconds of audio/video", "duration" },
     { "bytes",              OPT_TYPE_INT,             0, { &seek_by_bytes }, "seek by bytes 0=off 1=on -1=auto", "val" },
